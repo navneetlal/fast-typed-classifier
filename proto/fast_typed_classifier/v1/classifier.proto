@@ -1,0 +1,193 @@
+syntax = "proto3";
+
+package fast_typed_classifier.v1;
+
+// Typed-decision classification over text or JSON, backed by Laya checkpoints.
+//
+// Every question in a request is answered in the same forward pass. Concurrent requests
+// (from any RPC below) are batched together on the server, so many small unary calls get
+// the same GPU efficiency as one large batch.
+service Classifier {
+  // Classify one input.
+  rpc Classify(ClassifyRequest) returns (ClassifyResponse);
+
+  // Classify many inputs in one call. Responses keep request order. A failed item does not
+  // fail the call: its response carries `error` instead of answers.
+  rpc ClassifyBatch(ClassifyBatchRequest) returns (ClassifyBatchResponse);
+
+  // Bidirectional stream for high-throughput clients. Each response is sent as soon as it is
+  // ready, not necessarily in request order: match responses by `request_id`. A failed item
+  // does not end the stream: its response carries `error`.
+  rpc ClassifyStream(stream ClassifyRequest) returns (stream ClassifyResponse);
+
+  // The routing decision only (which checkpoint would answer, and why). No forward pass.
+  rpc Route(ClassifyRequest) returns (Routing);
+
+  // Loaded checkpoints, device and batching limits.
+  rpc GetServerInfo(GetServerInfoRequest) returns (ServerInfo);
+}
+
+message ClassifyRequest {
+  // Caller-chosen id, echoed in the response. Needed to match responses on ClassifyStream.
+  string request_id = 1;
+
+  // The input to classify. Exactly one must be set.
+  oneof state {
+    // Plain text.
+    string text = 2;
+    // A JSON object (for example an email with from/subject/body fields) or a JSON array
+    // (a conversation, oldest turn first).
+    string json = 3;
+  }
+
+  // Questions to answer, in order. Ids must be unique. In ClassifyBatch this may be left empty
+  // to use the batch-level `questions`.
+  repeated Question questions = 4;
+
+  // Force a checkpoint: "english", "multilingual" or "typed-decisions" (aliases such as "en"
+  // work too). Empty: route automatically on the detected script and language.
+  string model = 5;
+
+  // Language hint such as "de" or "en_US". Empty: detect it.
+  string lang = 6;
+
+  // Token budget override for this request. 0: the checkpoint default (512 for english,
+  // 1024 for multilingual). multilingual accepts up to 8192.
+  uint32 max_len = 7;
+}
+
+message Question {
+  // Key of this question's answer in ClassifyResponse.answers.
+  string id = 1;
+  // What to decide, for example "Which department should handle this request?".
+  string instructions = 2;
+
+  oneof kind {
+    ChoiceQuestion choice = 3;
+    ScoreQuestion score = 4;
+    NoulQuestion noul = 5;
+  }
+}
+
+// Pick one label.
+message ChoiceQuestion {
+  repeated ChoiceOption options = 1;
+}
+
+message ChoiceOption {
+  string label = 1;
+  // Optional description of when this label applies.
+  string description = 2;
+}
+
+// An ordinal score. The answer is the expected level, from 0 to len(levels) - 1.
+message ScoreQuestion {
+  // Level descriptions, level 0 first.
+  repeated string levels = 1;
+}
+
+// A yes/no question. The answer is P(true).
+message NoulQuestion {
+  // Optional descriptions of when the statement holds / does not hold.
+  string true_description = 1;
+  string false_description = 2;
+  // Optional option texts shown to the model instead of "true"/"false". Set both or neither.
+  string true_label = 3;
+  string false_label = 4;
+}
+
+message ClassifyResponse {
+  string request_id = 1;
+  // Answers keyed by question id.
+  map<string, Answer> answers = 2;
+  Routing routing = 3;
+  // Tokens the model read for this request, over all its questions.
+  uint32 input_tokens = 4;
+  Timing timing = 5;
+  // Set instead of answers when this item failed (ClassifyBatch and ClassifyStream only;
+  // Classify returns a gRPC status instead).
+  Error error = 6;
+}
+
+enum QuestionType {
+  QUESTION_TYPE_UNSPECIFIED = 0;
+  QUESTION_TYPE_CHOICE = 1;
+  QUESTION_TYPE_SCORE = 2;
+  QUESTION_TYPE_NOUL = 3;
+}
+
+message Answer {
+  QuestionType type = 1;
+
+  oneof value {
+    // choice: the chosen label.
+    string choice = 2;
+    // score: the expected level, from 0 to len(levels) - 1.
+    double score = 3;
+    // noul: P(true).
+    double noul = 4;
+  }
+
+  // choice: one probability per option, in request order. score: one per level.
+  // noul: [P(false), P(true)].
+  repeated double probabilities = 5;
+  // Laya's `confidence`: max(p) for noul, normalized entropy for choice and score.
+  double confidence = 6;
+  // Calibrated confidence in the returned answer, comparable across question types.
+  double answer_confidence = 7;
+  double act_probability = 8;
+}
+
+message Routing {
+  // Checkpoint that answered (or would answer): english, multilingual or typed-decisions.
+  string model = 1;
+  // Why the router picked it.
+  string reason = 2;
+  // Detected script and language, when detection ran (empty when `model` or `lang` decided).
+  string detected_script = 3;
+  string detected_language = 4;
+}
+
+message Timing {
+  // Time from arrival at the server to the start of the forward pass, including tokenization.
+  double queue_ms = 1;
+  // Forward pass and decoding of the batch this request ran in.
+  double inference_ms = 2;
+  // Number of requests that shared that batch.
+  uint32 batch_size = 3;
+}
+
+message Error {
+  // A gRPC status code (google.rpc.Code), for example 3 for INVALID_ARGUMENT.
+  int32 code = 1;
+  string message = 2;
+}
+
+message ClassifyBatchRequest {
+  repeated ClassifyRequest requests = 1;
+  // Default questions for requests that have none.
+  repeated Question questions = 2;
+}
+
+message ClassifyBatchResponse {
+  repeated ClassifyResponse responses = 1;
+}
+
+message GetServerInfoRequest {}
+
+message ServerInfo {
+  string device = 1;
+  repeated ModelInfo models = 2;
+  uint32 max_batch_rows = 3;
+  uint32 max_batch_tokens = 4;
+  uint32 max_inflight = 5;
+  string laya_version = 6;
+  string torch_version = 7;
+}
+
+message ModelInfo {
+  string name = 1;
+  string repo = 2;
+  // Default token budget.
+  uint32 max_len = 3;
+}
