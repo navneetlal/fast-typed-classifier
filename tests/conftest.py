@@ -39,12 +39,13 @@ class FakeAgent:
     """Stands in for laya.Agent: one row per question, token count = characters of the state,
     and logits that carry the row's tag, so decoding reveals which row an answer came from."""
 
-    def __init__(self, name: str, delay: float = 0.0):
+    def __init__(self, name: str, delay: float = 0.0, question_tokens: bool = False):
         self.name = name
         self.device = torch.device("cpu")
         self.cfg = {"max_len": 512}
         self.tok = _Tok()
         self.delay = delay            # seconds per forward pass
+        self.question_tokens = question_tokens  # rows also get one token per instruction character
         self.fail_tags: set = set()   # a forward pass containing one of these rows raises
         self.calls: List[Dict] = []   # one entry per forward pass
         self._lock = threading.Lock()
@@ -56,7 +57,8 @@ class FakeAgent:
         for j, qid in enumerate(ids):
             q = internal[qid]
             k = len(q["crit"]) if q["t"] in ("choice", "score") else 2
-            items.append({"ids": [tag_for(state, j)] + [7] * max(length, 1),
+            extra = len(q["ins"]) if self.question_tokens else 0
+            items.append({"ids": [tag_for(state, j)] + [7] * (max(length, 1) + extra),
                           "markers": list(range(1, k + 1)),
                           "qtype": {"choice": 0, "score": 1, "noul": 2}[q["t"]]})
         return items
@@ -99,7 +101,7 @@ class FakeAgent:
 
 
 def fake_engine(models=("english", "multilingual"), delay: float = 0.0, **limits) -> Engine:
-    values = dict(max_batch_rows=8, max_batch_tokens=4096, max_inflight=1024, max_wait_ms=0.0)
+    values = dict(max_batch_rows=8, max_batch_tokens=4096, max_inflight=1024, max_wait_ms=0.0, max_padding=0.25)
     values.update(limits)
     agents = {name: FakeAgent(name, delay) for name in models}
     return Engine(Router(max_loaded=len(models)), agents, Limits(**values), prep_threads=4)

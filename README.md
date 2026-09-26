@@ -132,8 +132,9 @@ e.g. `FTC_PORT=50051 FTC_MODELS=multilingual`.
 | `--device` | `auto` | `auto` picks `cuda` if available, else `cpu`. `mps` (Apple GPU) only when named. |
 | `--models` | `english,multilingual` | Checkpoints to load, or `all`. Everything auto-routed is covered by these two. |
 | `--default-route` | `english` | Checkpoint for text whose language cannot be determined. |
-| `--max-batch-rows` | 512 on CUDA, 8 on CPU | Most (input, question) rows per forward pass. |
-| `--max-batch-tokens` | 32768 on CUDA, 4096 on CPU | Most padded tokens per forward pass (bounds memory). |
+| `--max-batch-rows` | 512 on CUDA, 8 on CPU and MPS | Most (input, question) rows per forward pass. |
+| `--max-batch-tokens` | 32768 on CUDA, 4096 on CPU and MPS | Most padded tokens per forward pass (bounds memory). |
+| `--max-padding` | 0.5 on CUDA, 0.1 on CPU and MPS | Requests share a pass only if the padding that adds costs at most this fraction more than separate passes. |
 | `--max-inflight` | `1024` | Most requests admitted at once; more get `RESOURCE_EXHAUSTED`. |
 | `--max-wait-ms` | `0` | How long an idle server waits to fill a batch. 0 adds no latency. |
 | `--prep-threads` | `4` | Threads for routing and tokenization. |
@@ -173,8 +174,13 @@ Each request goes through a three-stage pipeline, so the device never waits on P
   row is decoded with its own language's calibration, exactly as `Router.predict` does. (Laya's own
   `Router.predict_batch` batches only identical question sets and drops the detected language, which
   changes confidence values for non-English text.)
-- **No padding waste.** Rows are sorted by length and split so short inputs are never padded to a
-  long document's length, and no pass exceeds `--max-batch-tokens`.
+- **Length-matched batches.** Requests are sorted by length, and a short request shares a pass with a
+  longer one only if the padding costs at most `--max-padding` more than running them separately.
+  Without this, a 30-word request batched with a 250-word one is padded to about 8x its length, and
+  on CPU and MPS every padding token costs as much as a real one. A request's own rows always stay in
+  one pass (as in `Router.predict`), because splitting them costs a whole extra pass: each pass
+  streams all the model weights, about 1.7 GB for `english`. Only a request too big for
+  `--max-batch-rows` / `--max-batch-tokens` on its own is split.
 - **Load shedding.** Admission is checked before any parsing. Requests cancelled or timed out
   while queued are skipped before they reach the model, and one failing request is retried alone so
   it cannot fail its batch-mates.
@@ -206,6 +212,31 @@ batch 1 to 32. Batching therefore adds almost no throughput there. The small CPU
 (8 rows) was the best measured: 4.9 req/s against 4.1 for 4 rows and 4.2 for 32 rows. CPU throughput scales
 by adding replicas, not bigger batches.
 
+### Measured on the Apple GPU (M1, `--device mps`)
+
+Same load test and defaults (8 rows, 4096 tokens, 10% padding):
+
+| Load | MPS | CPU (from above) |
+|---|---|---|
+| 1 client, English, p50 | 188 ms | 285 ms |
+| 1 client, multilingual, p50 | 85 ms | 97 ms |
+| 8 clients mixed, throughput | 6.9 to 7.1 req/s (p50 about 1.1 s) | 4.9 req/s |
+
+- **fp16 only when batched.** Laya runs a forward pass in fp16 on MPS only when it has 5 or more rows. So a lone
+  4-question request runs in fp32, and two batched requests (8 rows) run in fp16. In back-to-back
+  runs this was faster than fp32 without batching (`--max-batch-rows 4`): 6.9 vs 5.9 req/s at 8
+  clients. An alternating re-test to rule out heat was cut short when the Mac went to sleep.
+  Batched answers differ from a lone request's by at most 0.006, with the same labels.
+- **No first-time cost for new input lengths.** 40 requests with lengths the server had never seen
+  ran as fast as the same requests repeated, on MPS and on CPU.
+- **Length-matched batching matters here.** With 40 English requests of 3 to 250 words at 8 clients, matching
+  requests by length raised MPS throughput from 1.53 to 1.65 req/s. Splitting a single request's
+  rows by length instead made one client 20% slower, which is why a request's rows stay together.
+
+These numbers come from a fanless MacBook Air: sustained runs slow down as it heats up, and it
+sleeps when idle on battery, so repeated measurements vary by about 15%. Compare settings in
+alternating runs with cool-downs between them, and keep the machine awake (`caffeinate -i`).
+
 ### On CUDA
 
 Production is meant to run on CUDA, where batching pays off: Laya's own numbers on a T4 are 33 ms for one
@@ -213,8 +244,10 @@ question versus 7.2 ms per question batched. Nothing in the code is CPU-specific
 selects the GPU, Laya enables fp16/bf16 autocast, and the batch limits switch to 512 rows / 32768
 tokens. **This has not been run on a CUDA GPU yet.** Before production:
 
-- Run the test suite on the GPU host (`pytest -m models` compares answers with `Router.predict`;
-  on GPU, reduced precision may need the tolerances loosened slightly).
+- Run the test suite on the GPU host: `FTC_TEST_DEVICE=cuda pytest -m models` compares answers with
+  `Router.predict`. On GPUs, batched requests may run in fp16 where a lone request runs in fp32, so
+  that test allows differences up to 0.02 for batched requests (measured on MPS: up to 0.006), but
+  chosen labels must match exactly.
 - Run `bench/load_test.py` at rising `--concurrency` and tune `--max-batch-rows` / `--max-batch-tokens`
   for the GPU's memory and your latency target.
 - At high request rates, Python work per request (about 1.5 ms of tokenization) can become the limit
@@ -224,8 +257,9 @@ tokens. **This has not been run on a CUDA GPU yet.** Before production:
 ## Testing
 
 ```bash
-.venv/bin/python -m pytest -m "not models"   # 54 tests, about 5 s: conversion, batching engine, gRPC surface
-.venv/bin/python -m pytest                   # all 58, adds the real checkpoints on CPU (about 30 s)
+.venv/bin/python -m pytest -m "not models"   # 57 tests, about 5 s: conversion, batching engine, gRPC surface
+.venv/bin/python -m pytest                   # all 61, adds the real checkpoints on CPU (about 30 s)
+FTC_TEST_DEVICE=mps .venv/bin/python -m pytest -m models   # the real checkpoints on the Apple GPU
 ```
 
 - `tests/test_convert.py`: proto ↔ Laya conversion and every validation rule.
@@ -235,9 +269,11 @@ tokens. **This has not been run on a CUDA GPU yet.** Before production:
   multilingual fallback.
 - `tests/test_service.py`: every RPC over a real socket, error codes, batch and stream per-item errors,
   deadlines (a timed-out request never reaches the model), health, reflection, and graceful shutdown.
-- `tests/test_real_models.py`: the real checkpoints on CPU, compared with `Router.predict` across
-  English, Hindi, German, Spanish, a conversation, `lang` and `model` overrides, truncation and every
-  question type. The answers match exactly, including when 30 requests run concurrently in shared batches.
+- `tests/test_real_models.py`: the real checkpoints (CPU by default, or `FTC_TEST_DEVICE`), compared with
+  `Router.predict` across English, Hindi, German, Spanish, a conversation, `lang` and `model` overrides,
+  truncation and every question type. On CPU the answers match exactly, including when 30 requests
+  run concurrently in shared batches. On MPS single requests match exactly; batched ones are within
+  0.006, with the same labels.
 
 Load test against a running server:
 

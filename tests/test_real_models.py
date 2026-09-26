@@ -1,7 +1,7 @@
-"""End to end with the real checkpoints on CPU: gRPC answers must match laya's Router.predict.
+"""End to end with the real checkpoints: gRPC answers must match laya's Router.predict.
 
 Slow (loads two checkpoints, ~3 GB). Run with `pytest -m models`; skipped when the checkpoints
-are not in .hf-cache/.
+are not in .hf-cache/. Runs on CPU; set FTC_TEST_DEVICE=mps or FTC_TEST_DEVICE=cuda to test a GPU.
 """
 import os
 import time
@@ -16,6 +16,13 @@ from fast_typed_classifier.v1 import classifier_pb2 as pb
 from fast_typed_classifier.v1 import classifier_pb2_grpc as pb_grpc
 
 from conftest import ROOT, running_server
+
+DEVICE = os.environ.get("FTC_TEST_DEVICE", "cpu")
+# A request that shares a batch can be padded differently than alone. On CPU that changes nothing
+# measurable. On GPUs, laya also switches to fp16 autocast once a forward pass has enough rows
+# (MPS: 5), so a batched request can run in fp16 where it would run alone in fp32; measured up to
+# 0.0062 on MPS. Chosen labels must still match exactly.
+BATCHED_TOL = 5e-3 if DEVICE == "cpu" else 2e-2
 
 pytestmark = [
     pytest.mark.models,
@@ -87,7 +94,8 @@ def to_request(case, request_id=""):
 
 @pytest.fixture(scope="module")
 def served():
-    engine = Engine.load(["english", "multilingual"], device="cpu")
+    engine = Engine.load(["english", "multilingual"], device=DEVICE)
+    assert engine.device.startswith(DEVICE), engine.device
     # References first, one at a time: they share the engine's loaded agents.
     references = {name: engine.router.predict(state, questions, **kwargs) for name, state, questions, kwargs in CASES}
     engine.warm_up()
@@ -143,8 +151,7 @@ def test_concurrent_requests_match_router_predict(served):
     for case, future in futures:
         response = future.result()
         assert response.request_id.startswith(case[0])
-        # Batch-mates change padding, which can move float results in the last digits.
-        worst = max(worst, max_diff(response, references[case[0]], tol=5e-3))
+        worst = max(worst, max_diff(response, references[case[0]], tol=BATCHED_TOL))
         batch_sizes.append(response.timing.batch_size)
     assert max(batch_sizes) > 1
     print("\nconcurrent: largest difference = %g, batch sizes seen = %s" % (worst, sorted(set(batch_sizes))))
@@ -155,11 +162,11 @@ def test_stream_and_batch_match_router_predict(served):
     responses = list(stub.ClassifyStream(iter([to_request(c) for c in CASES]), timeout=120))
     assert sorted(r.request_id for r in responses) == sorted(c[0] for c in CASES)
     for r in responses:
-        max_diff(r, references[r.request_id], tol=5e-3)
+        max_diff(r, references[r.request_id], tol=BATCHED_TOL)
     batch = stub.ClassifyBatch(pb.ClassifyBatchRequest(requests=[to_request(c) for c in CASES]), timeout=120)
     assert [r.request_id for r in batch.responses] == [c[0] for c in CASES]
     for r in batch.responses:
-        max_diff(r, references[r.request_id], tol=5e-3)
+        max_diff(r, references[r.request_id], tol=BATCHED_TOL)
 
 
 def test_single_request_latency_is_model_bound(served):

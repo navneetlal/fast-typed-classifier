@@ -61,16 +61,20 @@ class Limits:
     # How long an idle inference thread waits for more requests before starting a batch.
     # 0 starts at once; requests that arrive during a forward pass still batch together.
     max_wait_ms: float = 0.0
+    # Requests are merged into one forward pass only if the padding that adds costs at most this
+    # fraction more tokens than running them in separate passes.
+    max_padding: float = 0.25
 
 
 # On CPU and Apple GPUs the forward pass is compute-bound even for one request (measured on an
-# M1: time per request is flat from batch 1 to 32), so batching adds no throughput and makes each
-# request wait for the whole batch. Small batches give the lowest latency. On CUDA, batching is
-# several times faster per request, so batches are bounded only by memory.
+# M1: time per request is flat from batch 1 to 32), so batching adds little throughput, makes each
+# request wait for the whole batch, and every padding token costs as much as a real one. Small,
+# tightly length-matched batches were fastest there. On CUDA, batching is several times faster per
+# request and a GPU has headroom for some padding, so batches are bounded mainly by memory.
 DEVICE_LIMITS = {
-    "cpu": dict(max_batch_rows=8, max_batch_tokens=4096),
-    "mps": dict(max_batch_rows=8, max_batch_tokens=4096),
-    "cuda": dict(max_batch_rows=512, max_batch_tokens=32768),
+    "cpu": dict(max_batch_rows=8, max_batch_tokens=4096, max_padding=0.1),
+    "mps": dict(max_batch_rows=8, max_batch_tokens=4096, max_padding=0.1),
+    "cuda": dict(max_batch_rows=512, max_batch_tokens=32768, max_padding=0.5),
 }
 
 
@@ -286,19 +290,58 @@ class Engine:
         q.extendleft(reversed(skipped))
         return name, taken
 
-    def _chunks(self, rows: List[Dict[str, Any]]) -> List[List[int]]:
-        """Row indices grouped into forward passes: sorted by length so short rows are not padded
-        to a long one, and capped at max_batch_rows and max_batch_tokens padded tokens."""
-        order = sorted(range(len(rows)), key=lambda r: len(rows[r]["ids"]))
+    def _chunks(self, jobs: List[_Job]) -> List[List[int]]:
+        """Group the rows of `jobs` (indexed as flattened in job order) into forward passes.
+
+        A request's rows stay together, as in `Router.predict`: splitting them costs a whole extra
+        pass (every pass streams all the weights), which measured slower than their padding.
+        Requests are sorted by their longest row and merged into one pass unless that would exceed
+        max_batch_rows, max_batch_tokens padded tokens, or cost more than max_padding above running
+        them in separate passes. Only a request too big for the budgets alone is split by rows.
+        """
+        limits = self.limits
+        units = []  # (longest row, first row index, row lengths)
+        offset = 0
+        for job in jobs:
+            lengths = [len(item["ids"]) for item in job.items]
+            units.append((max(lengths), offset, lengths))
+            offset += len(lengths)
+        units.sort(key=lambda u: u[0])
+
         chunks: List[List[int]] = []
         current: List[int] = []
-        for r in order:
-            padded = (len(current) + 1) * len(rows[r]["ids"])  # sorted, so this row is the longest
+        separate = 0  # padded tokens if the requests in `current` ran in separate passes
+        for longest, first, lengths in units:
+            n = len(lengths)
+            alone = n * longest
+            if n > limits.max_batch_rows or alone > limits.max_batch_tokens:
+                if current:
+                    chunks.append(current)
+                    current, separate = [], 0
+                chunks.extend(self._split_rows(first, lengths))
+                continue
+            merged = (len(current) + n) * longest  # sorted, so this request's longest row is the longest
+            if current and (len(current) + n > limits.max_batch_rows or merged > limits.max_batch_tokens
+                            or merged > (separate + alone) * (1.0 + limits.max_padding)):
+                chunks.append(current)
+                current, separate = [], 0
+            current.extend(range(first, first + n))
+            separate += alone
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _split_rows(self, first: int, lengths: List[int]) -> List[List[int]]:
+        """One request too big for a single pass: its rows by length, within the row and token budgets."""
+        order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+        chunks: List[List[int]] = []
+        current: List[int] = []
+        for i in order:
             if current and (len(current) + 1 > self.limits.max_batch_rows
-                            or padded > self.limits.max_batch_tokens):
+                            or (len(current) + 1) * lengths[i] > self.limits.max_batch_tokens):
                 chunks.append(current)
                 current = []
-            current.append(r)
+            current.append(first + i)
         if current:
             chunks.append(current)
         return chunks
@@ -309,7 +352,7 @@ class Engine:
         logits_rows: List[Any] = [None] * len(rows)
         act_rows: List[Any] = [None] * len(rows)
         with torch.inference_mode():
-            for chunk in self._chunks(rows):
+            for chunk in self._chunks(jobs):
                 batch = collate_items([[rows[r] for r in chunk]], agent.tok.pad_token_id)
                 logits, act = agent._forward(batch)
                 for i, r in enumerate(chunk):

@@ -51,6 +51,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="most (input, question) rows per forward pass (default: 512 on cuda, 8 on cpu)")
     p.add_argument("--max-batch-tokens", type=int, default=_int_env("MAX_BATCH_TOKENS"),
                    help="most padded tokens per forward pass (default: 32768 on cuda, 4096 on cpu)")
+    p.add_argument("--max-padding", type=float, default=_float_env("MAX_PADDING"),
+                   help="most padding per forward pass, as a fraction of real tokens (default: 0.5 on "
+                        "cuda, 0.1 on cpu and mps)")
     p.add_argument("--max-inflight", type=int, default=int(_env("MAX_INFLIGHT", "1024")),
                    help="most requests admitted at once; more get RESOURCE_EXHAUSTED (default: %(default)s)")
     p.add_argument("--max-wait-ms", type=float, default=float(_env("MAX_WAIT_MS", "0")),
@@ -71,6 +74,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def _int_env(name: str) -> Optional[int]:
     value = _env(name, "")
     return int(value) if value else None
+
+
+def _float_env(name: str) -> Optional[float]:
+    value = _env(name, "")
+    return float(value) if value else None
 
 
 def configure_model_cache() -> None:
@@ -174,8 +182,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     log.info("loading %s on %s (torch threads: %d)", args.models, device, torch.get_num_threads())
     engine = Engine.load(resolve_models(args.models), device=device, default_route=args.default_route,
                          prep_threads=args.prep_threads, max_batch_rows=args.max_batch_rows,
-                         max_batch_tokens=args.max_batch_tokens, max_inflight=args.max_inflight,
-                         max_wait_ms=args.max_wait_ms)
+                         max_batch_tokens=args.max_batch_tokens, max_padding=args.max_padding,
+                         max_inflight=args.max_inflight, max_wait_ms=args.max_wait_ms)
     log.info("limits: %s", engine.limits)
     if not args.no_warm_up:
         engine.warm_up()

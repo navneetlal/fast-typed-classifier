@@ -129,6 +129,57 @@ def test_short_rows_are_not_padded_to_a_long_one():
     assert [(c["rows"], c["padded_len"]) for c in calls] == [(8, 14), (2, 401)]  # ...in two passes (+1: the tag token)
 
 
+def test_rows_of_different_lengths_are_not_padded_together():
+    """Within max_padding, similar lengths share a pass; beyond it, the pass is split."""
+    states = ["x" * n for n in (100, 104, 108, 150, 155, 300)]
+
+    async def main():
+        engine = await started(fake_engine(delay=0.05, max_batch_rows=64, max_batch_tokens=100_000,
+                                           max_padding=0.1))
+        return engine, await queue_behind_blocker(engine, states, SHORT)
+
+    engine, results = run(main())
+    for state, result in zip(states, results):
+        assert_own_rows(result, state, SHORT)
+    calls = engine.agents["english"].calls[1:]
+    assert [(c["rows"], c["padded_len"]) for c in calls] == [(6, 109), (4, 156), (2, 301)]
+
+
+def test_a_requests_rows_stay_in_one_pass():
+    """Rows of one request differ in length (each question's text differs); splitting them would
+    cost an extra pass, so they share one, as in Router.predict."""
+    qset = build_question_set([client.noul("a", "Short?"),
+                               client.noul("b", "A much, much longer question about the same input?" * 3)])
+
+    async def main():
+        engine = fake_engine(max_padding=0.1)
+        for agent in engine.agents.values():
+            agent.question_tokens = True
+        await engine.start()
+        result = await engine.classify(ENGLISH, qset)
+        await engine.stop()
+        return engine, result
+
+    engine, result = run(main())
+    assert_own_rows(result, ENGLISH, qset)
+    [call] = engine.agents["english"].calls
+    assert call["rows"] == 2
+
+
+def test_a_request_too_big_for_one_pass_is_split_by_rows():
+    qset = build_question_set([client.noul("q%d" % i, "Question %d?" % i) for i in range(10)])
+
+    async def main():
+        engine = await started(fake_engine(max_batch_rows=4, max_batch_tokens=100_000))
+        result = await engine.classify(ENGLISH, qset)
+        await engine.stop()
+        return engine, result
+
+    engine, result = run(main())
+    assert_own_rows(result, ENGLISH, qset)
+    assert [c["rows"] for c in engine.agents["english"].calls] == [4, 4, 2]
+
+
 def test_batches_respect_row_and_token_budgets():
     rng = random.Random(3)
     states = ["x" * rng.randint(5, 300) + str(i) for i in range(40)]
@@ -276,6 +327,7 @@ def test_warm_up_runs_every_checkpoint():
 
 
 def test_default_limits_by_device():
-    assert default_limits("cuda").max_batch_rows == 512
-    assert default_limits("cpu").max_batch_rows == 8
+    assert (default_limits("cuda").max_batch_rows, default_limits("cuda").max_padding) == (512, 0.5)
+    assert (default_limits("cpu").max_batch_rows, default_limits("cpu").max_padding) == (8, 0.1)
+    assert default_limits("mps") == default_limits("cpu")
     assert default_limits("cpu", max_batch_rows=32, max_batch_tokens=None).max_batch_rows == 32
